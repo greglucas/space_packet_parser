@@ -13,20 +13,6 @@ from space_packet_parser import comparisons, parameters, packets
 logger = logging.getLogger(__name__)
 
 
-class UnrecognizedPacketTypeError(Exception):
-    """Error raised when we can't figure out which kind of packet we are dealing with based on the header"""
-
-    def __init__(self, *args, partial_data: dict = None):
-        """
-        Parameters
-        ----------
-        partial_data : dict, Optional
-            Data parsed so far (for debugging at higher levels)
-        """
-        super().__init__(*args)
-        self.partial_data = partial_data
-
-
 class XtcePacketDefinition:
     """Object representation of the XTCE definition of a CCSDS packet object"""
 
@@ -45,7 +31,8 @@ class XtcePacketDefinition:
             self,
             xtce_document: Union[str, Path, TextIO],
             *,
-            ns: Optional[dict] = None
+            ns: Optional[dict] = None,
+            root_container_name: str = "CCSDSPacket"
     ) -> None:
         """Instantiate an object representation of a CCSDS packet definition, according to a format specified in an XTCE
         XML document. The parser iteratively builds sequences of parameters according to the
@@ -68,6 +55,7 @@ class XtcePacketDefinition:
         self.ns = ns or self.tree.getroot().nsmap
         self.type_tag_to_object = {k.format(**self.ns): v for k, v in
                                    self._tag_to_type_template.items()}
+        self.root_container_name = root_container_name
 
         self._populate_sequence_container_cache()
 
@@ -335,11 +323,7 @@ class XtcePacketDefinition:
             restrictions = []
         return self._find_container(base_container_element.attrib['containerRef']), restrictions
 
-    def parse_ccsds_packet(self,
-                           packet: packets.CCSDSPacket,
-                           *,
-                           root_container_name: str = "CCSDSPacket",
-                           **parse_value_kwargs) -> packets.CCSDSPacket:
+    def parse_ccsds_packet(self, packet: packets.CCSDSPacket) -> packets.CCSDSPacket:
         """Parse binary packet data according to the self.packet_definition object
 
         Parameters
@@ -347,15 +331,14 @@ class XtcePacketDefinition:
         packet: packets.CCSDSPacket
             Binary representation of the packet used to get the coming bits and any
             previously parsed data items to infer field lengths.
-        root_container_name : str
-            Default is CCSDSPacket. Any root container may be specified.
 
         Returns
         -------
         Packet
             A Packet object containing header and data attributes.
         """
-        current_container: packets.SequenceContainer = self._sequence_container_cache[root_container_name]
+        current_container: packets.SequenceContainer = self._sequence_container_cache[self.root_container_name]
+
         while True:
             current_container.parse(packet)
 
@@ -372,14 +355,14 @@ class XtcePacketDefinition:
 
             if len(valid_inheritors) == 0:
                 if current_container.abstract:
-                    raise UnrecognizedPacketTypeError(
+                    raise packets.UnrecognizedPacketTypeError(
                         f"Detected an abstract container with no valid inheritors by restriction criteria. This might "
                         f"mean this packet type is not accounted for in the provided packet definition. "
                         f"APID={packet['PKT_APID']}.",
                         partial_data=packet)
                 break
 
-            raise UnrecognizedPacketTypeError(
+            raise packets.UnrecognizedPacketTypeError(
                 f"Multiple valid inheritors, {valid_inheritors} are possible for {current_container}.",
                 partial_data=packet)
         return packet
@@ -395,7 +378,7 @@ class XtcePacketDefinition:
             show_progress: bool = False,
             buffer_read_size_bytes: Optional[int] = None,
             skip_header_bytes: int = 0
-    ) -> Iterator[Union[packets.CCSDSPacket, UnrecognizedPacketTypeError]]:
+    ) -> Iterator[Union[packets.CCSDSPacket, packets.UnrecognizedPacketTypeError]]:
         """Create and return a Packet generator that reads from a ConstBitStream or a filelike object or a socket.
 
         Creating a generator object to return allows the user to create
@@ -441,34 +424,19 @@ class XtcePacketDefinition:
             If yield_unrecognized_packet_errors is True, it will yield an unraised exception object,
             which can be raised or used for debugging purposes.
         """
-        for packet in packets.packet_generator(binary_data,
-                                               buffer_read_size_bytes=buffer_read_size_bytes,
-                                               show_progress=show_progress,
-                                               skip_header_bytes=skip_header_bytes):
-            if ccsds_headers_only:
-                yield packet
-            try:
-                packet = self.parse_ccsds_packet(packet,
-                                                 root_container_name=root_container_name)
-            except UnrecognizedPacketTypeError as e:
-                logger.debug(f"Unrecognized error on packet with APID {packet['PKT_APID']}'")
-                if yield_unrecognized_packet_errors:
-                    # Yield the caught exception without raising it (raising ends generator)
-                    yield e
-                # Continue to next packet
-                continue
+        definition = None if ccsds_headers_only else self
 
-            actual_length_parsed = packet.raw_data.pos // 8
-            # PKT_LEN + 1 for user data + 6 bytes for the header
-            n_bytes_packet = packet['PKT_LEN'] + 7
-            if actual_length_parsed != n_bytes_packet:
-                logger.warning(f"Parsed packet length "
-                               f"({actual_length_parsed}B) did not match "
-                               f"length specified in header ({n_bytes_packet}B). "
-                               f"Updating the position to the correct position "
-                               "indicated by CCSDS header.")
-                if not parse_bad_pkts:
-                    logger.warning(f"Skipping (not yielding) bad packet with apid {packet['PKT_APID']}.")
-                    continue
-
-            yield packet
+        # Temporarily set the root container name to the provided value
+        # and the reset it after we call the generator
+        original_root_container_name = self.root_container_name
+        try:
+            self.root_container_name = root_container_name
+            yield from packets.packet_generator(binary_data,
+                                                definition=definition,
+                                                buffer_read_size_bytes=buffer_read_size_bytes,
+                                                parse_bad_pkts=parse_bad_pkts,
+                                                show_progress=show_progress,
+                                                skip_header_bytes=skip_header_bytes,
+                                                yield_unrecognized_packet_errors=yield_unrecognized_packet_errors)
+        finally:
+            self.root_container_name = original_root_container_name

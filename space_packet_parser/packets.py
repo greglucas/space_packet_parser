@@ -8,7 +8,10 @@ import logging
 from collections import namedtuple
 import socket
 import time
-from typing import BinaryIO, Iterator, List, Optional, Protocol, Union
+from typing import BinaryIO, Iterator, List, Optional, Protocol, TYPE_CHECKING, Union
+
+if TYPE_CHECKING:
+    from space_packet_parser import definitions
 
 BuiltinDataTypes = Union[bytes, float, int, str]
 logger = logging.getLogger(__name__)
@@ -268,10 +271,13 @@ class UnrecognizedPacketTypeError(Exception):
 
 def packet_generator(  # pylint: disable=too-many-branches,too-many-statements
             binary_data: Union[BinaryIO, socket.socket],
+            definition: Optional['definitions.XtcePacketDefinition'] = None,
             *,
             buffer_read_size_bytes: Optional[int] = None,
+            parse_bad_pkts: bool = True,
             show_progress: bool = False,
             skip_header_bytes: int = 0,
+            yield_unrecognized_packet_errors: bool = False,
         ) -> Iterator[CCSDSPacket]:
     """Create and return a Packet generator that reads from a ConstBitStream or a filelike object or a socket.
 
@@ -282,16 +288,28 @@ def packet_generator(  # pylint: disable=too-many-branches,too-many-statements
     ----------
     binary_data : Union[BinaryIO, socket.socket]
         Binary data source containing CCSDSPackets.
-    buffer_read_size_bytes : Optional[int]
+    buffer_read_size_bytes : int, optional
         Number of bytes to read from e.g. a BufferedReader or socket binary data source on each read attempt.
         If None, defaults to 4096 bytes from a socket, -1 (full read) from a file.
-    skip_header_bytes : int
-        Default 0. The parser skips this many bytes at the beginning of every packet. This allows dynamic stripping
-        of additional header data that may be prepended to packets in "raw record" file formats.
+    parse_bad_pkts : bool
+        Default True.
+        If True, when the generator encounters a packet with an incorrect length it will still yield the packet
+        (the data will likely be invalid). If False, the generator will still write a debug log message but will
+        otherwise silently skip the bad packet.
     show_progress : bool
         Default False.
         If True, prints a status bar. Note that for socket sources, the percentage will be zero until the generator
         ends.
+    skip_header_bytes : int
+        Default 0. The parser skips this many bytes at the beginning of every packet. This allows dynamic stripping
+        of additional header data that may be prepended to packets in "raw record" file formats.
+    yield_unrecognized_packet_errors : bool
+        Default False.
+        If False, UnrecognizedPacketTypeErrors are caught silently and parsing continues to the next packet.
+        If True, the generator will yield an UnrecognizedPacketTypeError in the event of an unrecognized
+        packet. Note: These exceptions are not raised by default but are instead returned so that the generator
+        can continue. You can raise the exceptions if desired. Leave this as False unless you need to examine the
+        partial data from unrecognized packets.
 
     Yields
     -------
@@ -378,7 +396,36 @@ def packet_generator(  # pylint: disable=too-many-branches,too-many-statements
         packet_bytes = read_buffer[current_pos:current_pos + n_bytes_packet]
         current_pos += n_bytes_packet
         # Wrap the bytes in a class that can keep track of position as we read from it
-        yield CCSDSPacket(header, raw_data=packet_bytes)
+        packet = CCSDSPacket(header, raw_data=packet_bytes)
+        if definition is None:
+            yield packet
+            continue
+
+        # Continue to try and parse the data if we have a definition available
+        try:
+            packet = definition.parse_ccsds_packet(packet)
+        except UnrecognizedPacketTypeError as e:
+            logger.debug(f"Unrecognized error on packet with APID {packet['PKT_APID']}'")
+            if yield_unrecognized_packet_errors:
+                # Yield the caught exception without raising it (raising ends generator)
+                yield e
+            # Continue to next packet
+            continue
+
+        actual_length_parsed = packet.raw_data.pos // 8
+        # PKT_LEN + 1 for user data + 6 bytes for the header
+        n_bytes_packet = packet['PKT_LEN'] + 7
+        if actual_length_parsed != n_bytes_packet:
+            logger.warning(f"Parsed packet length "
+                           f"({actual_length_parsed}B) did not match "
+                           f"length specified in header ({n_bytes_packet}B). "
+                           f"Updating the position to the correct position "
+                           "indicated by CCSDS header.")
+            if not parse_bad_pkts:
+                logger.warning(f"Skipping (not yielding) bad packet with apid {packet['PKT_APID']}.")
+                continue
+
+        yield packet
 
     if show_progress:
         _print_progress(current_bytes=n_bytes_parsed, total_bytes=total_length_bytes,
