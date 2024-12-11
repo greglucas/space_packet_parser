@@ -3,9 +3,9 @@
 
 from dataclasses import dataclass, field
 import datetime as dt
+from functools import cached_property
 import io
 import logging
-from collections import namedtuple
 import socket
 import time
 from typing import BinaryIO, Iterator, List, Optional, Protocol, TYPE_CHECKING, Union
@@ -66,6 +66,70 @@ class StrParameter(_Parameter, str):
 ParameterDataTypes = Union[BinaryParameter, BoolParameter, FloatParameter, IntParameter, StrParameter]
 
 
+class RawCCSDSPacket(bytes):
+    """A class to represent raw CCSDS packet data as bytes.
+
+    This adds a few convenience methods to the bytes class to make it easier to
+    extract the header fields from the packet data.
+    """
+    @cached_property
+    def version_number(self) -> int:
+        """CCSDS Packet Version Number"""
+        return _extract_bits(self, 0, 3)
+
+    @cached_property
+    def type(self) -> int:
+        """CCSDS Packet Type
+
+        0 = Telemetry Packet
+        1 = Telecommand Packet
+        """
+        return _extract_bits(self, 3, 1)
+
+    @cached_property
+    def secondary_header_flag(self) -> int:
+        """CCSDS Secondary Header Flag
+
+        0 = No secondary header
+        1 = Secondary header present
+        """
+
+        return _extract_bits(self, 4, 1)
+
+    @cached_property
+    def apid(self) -> int:
+        """CCSDS Application Process Identifier (APID)"""
+        return _extract_bits(self, 5, 11)
+
+    @cached_property
+    def sequence_flags(self) -> int:
+        """CCSDS Packet Sequence Flags
+
+        00 = Continuation packet
+        01 = First packet
+        10 = Last packet
+        11 = Unsegmented packet (standalone)
+        """
+        return _extract_bits(self, 16, 2)
+
+    @cached_property
+    def sequence_count(self) -> int:
+        """CCSDS Packet Sequence Count"""
+        return _extract_bits(self, 18, 14)
+
+    @cached_property
+    def data_length(self) -> int:
+        """CCSDS Packet Data Length
+
+        Section 4.1.3.5.3 The length count C shall be expressed as:
+        C = (Total Number of Octets in the Packet Data Field) – 1
+        """
+        # This has already been parsed previously to give us the length of the packet
+        # so avoid the extract_bits call again and calculate it based on the length of the data
+        # Subtract 6 bytes for the header and 1 for the length count
+        return len(self) - 6 - 1
+
+
 class RawPacketData(bytes):
     """A class to represent raw packet data as bytes but whose length is represented by bit length.
 
@@ -83,10 +147,10 @@ class RawPacketData(bytes):
         self._nbits = len(data) * 8
         super().__init__()
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self._nbits
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"RawPacketData({self}, {len(self)}b, pos={self.pos})"
 
     def read_as_bytes(self, nbits: int) -> bytes:
@@ -133,18 +197,6 @@ class RawPacketData(bytes):
         return int_data
 
 
-CcsdsPacketHeaderElement = namedtuple('CcsdsPacketHeaderElement', ['name', 'nbits'])
-
-CCSDS_HEADER_DEFINITION = [
-    CcsdsPacketHeaderElement('VERSION', 3),
-    CcsdsPacketHeaderElement('TYPE', 1),
-    CcsdsPacketHeaderElement('SEC_HDR_FLG', 1),
-    CcsdsPacketHeaderElement('PKT_APID', 11),
-    CcsdsPacketHeaderElement('SEQ_FLGS', 2),
-    CcsdsPacketHeaderElement('SRC_SEQ_CTR', 14),
-    CcsdsPacketHeaderElement('PKT_LEN', 16)
-]
-
 CCSDS_HEADER_LENGTH_BYTES = 6
 
 
@@ -180,27 +232,6 @@ class CCSDSPacket(dict):
     def user_data(self) -> dict:
         """The user data content of the packet."""
         return dict(list(self.items())[7:])
-
-    @staticmethod
-    def _parse_header(packet_data: bytes) -> dict:
-        """Parses the CCSDS standard header.
-
-        Parameters
-        ----------
-        packet_data : bytes
-            6 bytes of binary data.
-
-        Returns
-        -------
-        header : dict
-            Dictionary of header items.
-        """
-        header = {}
-        current_bit = 0
-        for item in CCSDS_HEADER_DEFINITION:
-            header[item.name] = _extract_bits(packet_data, current_bit, item.nbits)
-            current_bit += item.nbits
-        return header
 
 
 class Parseable(Protocol):
@@ -269,7 +300,125 @@ class UnrecognizedPacketTypeError(Exception):
         self.partial_data = partial_data
 
 
-def packet_generator(  # pylint: disable=too-many-branches,too-many-statements
+def raw_packet_generator(  # pylint: disable=too-many-branches
+            binary_data: Union[BinaryIO, socket.socket],
+            *,
+            buffer_read_size_bytes: Optional[int] = None,
+            show_progress: bool = False,
+            skip_header_bytes: int = 0,
+) -> Iterator[RawCCSDSPacket]:
+    """A generator that reads raw packet data from a filelike object or a socket.
+
+    Creating a generator object to return allows the user to create
+    many generators from a single Parser and reduces memory usage.
+
+    Parameters
+    ----------
+    binary_data : Union[BinaryIO, socket.socket]
+        Binary data source containing CCSDSPackets.
+    buffer_read_size_bytes : int, optional
+        Number of bytes to read from e.g. a BufferedReader or socket binary data source on each read attempt.
+        If None, defaults to 4096 bytes from a socket, -1 (full read) from a file.
+    show_progress : bool
+        Default False.
+        If True, prints a status bar. Note that for socket sources, the percentage will be zero until the generator
+        ends.
+    skip_header_bytes : int
+        Default 0. The parser skips this many bytes at the beginning of every packet. This allows dynamic stripping
+        of additional header data that may be prepended to packets in "raw record" file formats.
+
+    Yields
+    -------
+    RawCCSDSPacket
+        Generator yields a RawCCSDSPacket object containing the raw packet data.
+    """
+    # ========
+    # Set up the reader based on the type of binary_data
+    # ========
+    if isinstance(binary_data, io.BufferedIOBase):
+        if buffer_read_size_bytes is None:
+            # Default to a full read of the file
+            buffer_read_size_bytes = -1
+        total_length_bytes = binary_data.seek(0, io.SEEK_END)  # This is probably preferable to len
+        binary_data.seek(0, 0)
+        logger.info(f"Creating packet generator from a filelike object, {binary_data}. "
+                    f"Total length is {total_length_bytes} bytes")
+        read_bytes_from_source = binary_data.read
+    elif isinstance(binary_data, socket.socket):  # It's a socket and we don't know how much data we will get
+        logger.info("Creating packet generator to read from a socket. Total length to parse is unknown.")
+        total_length_bytes = None  # We don't know how long it is
+        if buffer_read_size_bytes is None:
+            # Default to 4096 bytes from a socket
+            buffer_read_size_bytes = 4096
+        read_bytes_from_source = binary_data.recv
+    elif isinstance(binary_data, io.TextIOWrapper):
+        raise IOError("Packet data file opened in TextIO mode. You must open packet data in binary mode.")
+    else:
+        raise IOError(f"Unrecognized data source: {binary_data}")
+
+    # ========
+    # Packet loop. Each iteration of this loop yields a RawPacketData object
+    # ========
+    start_time = time.time_ns()
+    n_bytes_parsed = 0  # Keep track of how many bytes we have parsed
+    n_packets_parsed = 0  # Keep track of how many packets we have parsed
+    read_buffer = b""  # Empty bytes object to start
+    current_pos = 0  # Keep track of where we are in the buffer
+    while True:
+        if total_length_bytes and n_bytes_parsed == total_length_bytes:
+            break  # Exit if we know the length and we've reached it
+
+        if show_progress:
+            _print_progress(current_bytes=n_bytes_parsed, total_bytes=total_length_bytes,
+                            start_time_ns=start_time, current_packets=n_packets_parsed)
+
+        if current_pos > 20_000_000:
+            # Only trim the buffer after 20 MB read to prevent modifying
+            # the bitstream and trimming after every packet
+            read_buffer = read_buffer[current_pos:]
+            current_pos = 0
+
+        # Fill buffer enough to parse a header
+        while len(read_buffer) - current_pos < skip_header_bytes + CCSDS_HEADER_LENGTH_BYTES:
+            result = read_bytes_from_source(buffer_read_size_bytes)
+            if not result:  # If there is verifiably no more data to add, break
+                break
+            read_buffer += result
+        # Skip the header bytes
+        current_pos += skip_header_bytes
+        header_bytes = read_buffer[current_pos:current_pos + CCSDS_HEADER_LENGTH_BYTES]
+
+        # per the CCSDS spec
+        # 4.1.3.5.3 The length count C shall be expressed as:
+        #   C = (Total Number of Octets in the Packet Data Field) – 1
+        n_bytes_data = _extract_bits(header_bytes, 32, 16) + 1
+        n_bytes_packet = CCSDS_HEADER_LENGTH_BYTES + n_bytes_data
+
+        # Fill the buffer enough to read a full packet, taking into account the user data length
+        while len(read_buffer) - current_pos < n_bytes_packet:
+            result = read_bytes_from_source(buffer_read_size_bytes)
+            if not result:  # If there is verifiably no more data to add, break
+                break
+            read_buffer += result
+
+        # Consider it a counted packet once we've verified that we have read the full packet and parsed the header
+        # Update the number of packets and bytes parsed
+        n_packets_parsed += 1
+        n_bytes_parsed += skip_header_bytes + n_bytes_packet
+
+        # current_pos is still before the header, so we are reading the entire packet here
+        packet_bytes = read_buffer[current_pos:current_pos + n_bytes_packet]
+        current_pos += n_bytes_packet
+        # Wrap the bytes in a class that can keep track of position as we read from it
+        yield RawCCSDSPacket(packet_bytes)
+
+    if show_progress:
+        _print_progress(current_bytes=n_bytes_parsed, total_bytes=total_length_bytes,
+                        start_time_ns=start_time, current_packets=n_packets_parsed,
+                        end="\n", log=True)
+
+
+def packet_generator(
             binary_data: Union[BinaryIO, socket.socket],
             definition: Optional['definitions.XtcePacketDefinition'] = None,
             *,
@@ -317,90 +466,11 @@ def packet_generator(  # pylint: disable=too-many-branches,too-many-statements
         Generator yields a CCSDSPacket object containing the parsed packet header and binary data
         of the packet as the ``raw_data`` attribute.
     """
-    # ========
-    # Set up the reader based on the type of binary_data
-    # ========
-    if isinstance(binary_data, io.BufferedIOBase):
-        if buffer_read_size_bytes is None:
-            # Default to a full read of the file
-            buffer_read_size_bytes = -1
-        total_length_bytes = binary_data.seek(0, io.SEEK_END)  # This is probably preferable to len
-        binary_data.seek(0, 0)
-        logger.info(f"Creating packet generator from a filelike object, {binary_data}. "
-                    f"Total length is {total_length_bytes} bytes")
-        read_bytes_from_source = binary_data.read
-    elif isinstance(binary_data, socket.socket):  # It's a socket and we don't know how much data we will get
-        logger.info("Creating packet generator to read from a socket. Total length to parse is unknown.")
-        total_length_bytes = None  # We don't know how long it is
-        if buffer_read_size_bytes is None:
-            # Default to 4096 bytes from a socket
-            buffer_read_size_bytes = 4096
-        read_bytes_from_source = binary_data.recv
-    elif isinstance(binary_data, io.TextIOWrapper):
-        raise IOError("Packet data file opened in TextIO mode. You must open packet data in binary mode.")
-    else:
-        raise IOError(f"Unrecognized data source: {binary_data}")
-
-    # ========
-    # Packet loop. Each iteration of this loop yields a CCSDSPacket object
-    # ========
-    start_time = time.time_ns()
-    n_bytes_parsed = 0  # Keep track of how many bytes we have parsed
-    n_packets_parsed = 0  # Keep track of how many packets we have parsed
-    read_buffer = b""  # Empty bytes object to start
-    current_pos = 0  # Keep track of where we are in the buffer
-    while True:
-        if total_length_bytes and n_bytes_parsed == total_length_bytes:
-            break  # Exit if we know the length and we've reached it
-
-        if show_progress:
-            _print_progress(current_bytes=n_bytes_parsed, total_bytes=total_length_bytes,
-                            start_time_ns=start_time, current_packets=n_packets_parsed)
-
-        if current_pos > 20_000_000:
-            # Only trim the buffer after 20 MB read to prevent modifying
-            # the bitstream and trimming after every packet
-            read_buffer = read_buffer[current_pos:]
-            current_pos = 0
-
-        # Fill buffer enough to parse a header
-        while len(read_buffer) - current_pos < skip_header_bytes + CCSDS_HEADER_LENGTH_BYTES:
-            result = read_bytes_from_source(buffer_read_size_bytes)
-            if not result:  # If there is verifiably no more data to add, break
-                break
-            read_buffer += result
-        # Skip the header bytes
-        current_pos += skip_header_bytes
-        header_bytes = read_buffer[current_pos:current_pos + CCSDS_HEADER_LENGTH_BYTES]
-        header = CCSDSPacket._parse_header(header_bytes)  # pylint: disable=protected-access
-
-        # per the CCSDS spec
-        # 4.1.3.5.3 The length count C shall be expressed as:
-        #   C = (Total Number of Octets in the Packet Data Field) – 1
-        n_bytes_data = header['PKT_LEN'] + 1
-        n_bytes_packet = CCSDS_HEADER_LENGTH_BYTES + n_bytes_data
-
-        # Based on PKT_LEN fill buffer enough to read a full packet
-        while len(read_buffer) - current_pos < n_bytes_packet:
-            result = read_bytes_from_source(buffer_read_size_bytes)
-            if not result:  # If there is verifiably no more data to add, break
-                break
-            read_buffer += result
-
-        # Consider it a counted packet once we've verified that we have read the full packet and parsed the header
-        # Update the number of packets and bytes parsed
-        n_packets_parsed += 1
-        n_bytes_parsed += skip_header_bytes + n_bytes_packet
-
-        # current_pos is still before the header, so we are reading the entire packet here
-        packet_bytes = read_buffer[current_pos:current_pos + n_bytes_packet]
-        current_pos += n_bytes_packet
-        # Wrap the bytes in a class that can keep track of position as we read from it
-        packet = CCSDSPacket(header, raw_data=packet_bytes)
-        if definition is None:
-            yield packet
-            continue
-
+    for raw_packet_data in raw_packet_generator(binary_data,
+                                                buffer_read_size_bytes=buffer_read_size_bytes,
+                                                show_progress=show_progress,
+                                                skip_header_bytes=skip_header_bytes):
+        packet = CCSDSPacket(raw_data=raw_packet_data)
         # Continue to try and parse the data if we have a definition available
         try:
             packet = definition.parse_ccsds_packet(packet)
@@ -426,11 +496,6 @@ def packet_generator(  # pylint: disable=too-many-branches,too-many-statements
                 continue
 
         yield packet
-
-    if show_progress:
-        _print_progress(current_bytes=n_bytes_parsed, total_bytes=total_length_bytes,
-                        start_time_ns=start_time, current_packets=n_packets_parsed,
-                        end="\n", log=True)
 
 
 def _print_progress(
