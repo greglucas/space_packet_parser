@@ -1,17 +1,16 @@
 """Module for parsing XTCE xml files to specify packet format"""
 import logging
-import socket
 import warnings
 from collections.abc import Iterable, Iterator
 from datetime import datetime
 from pathlib import Path
-from typing import BinaryIO, Optional, TextIO, Union
+from typing import Optional, TextIO, Union
 
 import lxml.etree as ElementTree
 from lxml.builder import ElementMaker
 
 import space_packet_parser as spp
-from space_packet_parser import ccsds, common
+from space_packet_parser import common
 from space_packet_parser.exceptions import InvalidParameterTypeError, UnrecognizedPacketTypeError
 from space_packet_parser.xtce import (
     DEFAULT_XTCE_NS_PREFIX,
@@ -473,7 +472,7 @@ class XtcePacketDefinition(common.AttrComparable):
 
     def packet_generator(
             self,
-            binary_data: Union[BinaryIO, socket.socket],
+            binary_data: bytes,
             *,
             parse_bad_pkts: bool = True,
             root_container_name: Optional[str] = None,
@@ -492,8 +491,8 @@ class XtcePacketDefinition(common.AttrComparable):
 
         Parameters
         ----------
-        binary_data : Union[BinaryIO, socket.socket]
-            Binary data source to parse into Packets.
+        binary_data : bytes
+            Binary data  to parse into Packets.
         parse_bad_pkts : bool
             Default True.
             If True, when the generator encounters a packet with an incorrect length it will still yield the packet
@@ -542,36 +541,34 @@ class XtcePacketDefinition(common.AttrComparable):
             which can be raised or used for debugging purposes.
         """
         root_container_name = root_container_name or self.root_container_name
+        packet_count = 0
+        # Keep track of the outer loop parsing pos
+        parsing_pos = 0
 
-        # Iterate over individual packets in the binary data
-        for raw_packet_data in ccsds.ccsds_generator(binary_data,
-                                                     buffer_read_size_bytes=buffer_read_size_bytes,
-                                                     show_progress=show_progress,
-                                                     skip_header_bytes=skip_header_bytes,
-                                                     combine_segmented_packets=combine_segmented_packets,
-                                                     secondary_header_bytes=secondary_header_bytes):
-            if ccsds_headers_only:
-                yield raw_packet_data
-                continue
+        # Loop through the binary data until we reach the end
+        while parsing_pos < len(binary_data) * 8:
+            # Start with an empty packet pointing to our binary data, setting the
+            # parsing position to the current position in the binary data
+            packet = spp.Packet(binary_data=binary_data)
+            packet._parsing_pos = parsing_pos
+            packet_count += 1
 
-            # Now do the actual parsing of the packet data
             try:
-                packet = self.parse_bytes(raw_packet_data, root_container_name=root_container_name)
+                packet = self.parse_packet(packet, root_container_name=root_container_name)
+                # Trim down this packet to only contain the bytes we parsed
+                packet.binary_data = packet.binary_data[parsing_pos // 8:packet._parsing_pos // 8]
+                # Update the outer loop parsing position to the current packet position
+                parsing_pos = packet._parsing_pos
             except UnrecognizedPacketTypeError as e:
-                logger.debug(f"Unrecognized error on packet with APID {raw_packet_data.apid}")
+                logger.debug(f"Unrecognized error on packet number {packet_count}, "
+                             f"stream bit position {parsing_pos}, "
+                             f"packet bit position {packet._parsing_pos - parsing_pos}.")
+                # Update the outer loop parsing position to the current packet position
+                parsing_pos = packet._parsing_pos
                 if yield_unrecognized_packet_errors:
                     # Yield the caught exception without raising it (raising ends generator)
                     yield e
                 # Continue to next packet
                 continue
-
-            if packet._parsing_pos != len(packet.binary_data) * 8:
-                warnings.warn(f"Number of bits parsed ({packet._parsing_pos}b) did not match "
-                              f"the length of data available ({len(packet.binary_data) * 8}b) for packet with APID "
-                              f"{raw_packet_data.apid}.")
-
-                if not parse_bad_pkts:
-                    logger.warning(f"Skipping (not yielding) bad packet with apid {raw_packet_data.apid}.")
-                    continue
 
             yield packet
