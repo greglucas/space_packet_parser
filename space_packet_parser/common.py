@@ -417,4 +417,5 @@ def _extract_bits(data: bytes, start_bit: int, nbits: int):
 
     # Shift the value to the right to move the LSB of the data item we want to parse
     # to the least significant position, then mask out the number of bits we want to keep
-    return (value >> (len(data) * 8 - start_bit_within_byte - nbits)) & (2**nbits - 1)
+    mask = (1 << nbits) - 1
+    return (value >> (len(data) * 8 - start_bit_within_byte - nbits)) & mask
